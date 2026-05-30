@@ -1,56 +1,35 @@
 """
-cadquery_gen.py — CadQuery code generator
+cadquery_gen.py — CadQuery code generator (V2)
 Converts a parsed CADModel into an executable CadQuery Python script.
 
-Coverage (V1):
-  - Line3D   → polyline / rect detection
-  - Circle3D → circle
-  - Planes   → XY, XZ, XZ_neg, YZ, YZ_neg, XY_neg + custom fallback
-  - Operations → new_body, cut, join
-  - Extent   → one_side, two_sides
-  - Orphan sketches → commented out
-  - Multi-profile extrudes → face selector loop
+Uses loop_builder to order curves into continuous contours before
+emitting code, fixing the "polyline not closed" and "arc midpoint" bugs.
 """
 
 from __future__ import annotations
 from typing import Optional
-import textwrap
 
-from parser import (
-    CADModel, CADStep, Sketch, Extrude,
-    Profile, Loop, Curve,
-    CurveLine, CurveCircle, CurveArc,
-    Workplane, Vec3,
+from parser import CADModel, Sketch, Extrude, Workplane, Vec3
+from loop_builder import (
+    order_loop, is_closed, is_polygon,
+    detect_rectangle, ordered_points, OrderedCurve,
 )
 
 
 # ── Plane helpers ─────────────────────────────────────────────────────────────
 
-# CadQuery standard plane names
 _CQ_PLANE_MAP = {
-    "XY"     : '"XY"',
-    "XY_neg" : '"XY"',   # will flip via origin offset
-    "XZ"     : '"XZ"',
-    "XZ_neg" : '"XZ"',
-    "YZ"     : '"YZ"',
-    "YZ_neg" : '"YZ"',
+    "XY": '"XY"', "XY_neg": '"XY"',
+    "XZ": '"XZ"', "XZ_neg": '"XZ"',
+    "YZ": '"YZ"', "YZ_neg": '"YZ"',
 }
 
-def _cq_plane(wp: Workplane) -> str:
-    """
-    Return the CadQuery Workplane plane argument string.
-    For standard planes returns a string literal ("XY", "XZ", "YZ").
-    For custom planes builds a cq.Plane(...) expression.
-    """
-    name = wp.plane_name
 
+def _cq_plane(wp: Workplane) -> str:
+    name = wp.plane_name
     if name and not wp.has_nonzero_origin:
         return _CQ_PLANE_MAP[name]
-
-    # Custom plane or non-zero origin → build explicit cq.Plane
-    o  = wp.origin
-    x  = wp.x_axis
-    z  = wp.z_axis
+    o, x, z = wp.origin, wp.x_axis, wp.z_axis
     return (
         f"cq.Plane("
         f"origin=({o.x*1000:.4f}, {o.y*1000:.4f}, {o.z*1000:.4f}), "
@@ -59,134 +38,79 @@ def _cq_plane(wp: Workplane) -> str:
     )
 
 
-# ── Curve helpers ─────────────────────────────────────────────────────────────
+# ── Arc midpoint ──────────────────────────────────────────────────────────────
 
-def _is_rect(curves: list[Curve]) -> Optional[tuple[float, float, float, float]]:
-    """
-    Detect if 4 Line3D curves form an axis-aligned rectangle.
-    Returns (x_min, y_min, width, height) in mm, or None.
-    """
-    if len(curves) != 4:
-        return None
-    if not all(isinstance(c, CurveLine) for c in curves):
-        return None
-
-    xs = set()
-    ys = set()
-    for c in curves:
-        xs.update([round(c.start.x * 1000, 6), round(c.end.x * 1000, 6)])
-        ys.update([round(c.start.y * 1000, 6), round(c.end.y * 1000, 6)])
-
-    if len(xs) == 2 and len(ys) == 2:
-        x_vals = sorted(xs)
-        y_vals = sorted(ys)
-        w = x_vals[1] - x_vals[0]
-        h = y_vals[1] - y_vals[0]
-        cx = (x_vals[0] + x_vals[1]) / 2
-        cy = (y_vals[0] + y_vals[1]) / 2
-        return (cx, cy, w, h)
-    return None
+def _arc_midpoint(arc: OrderedCurve) -> tuple[float, float]:
+    """Correct point ON the arc, halfway between start and end."""
+    import math
+    cx, cy = arc.center
+    sx, sy = arc.start
+    ex, ey = arc.end
+    a_start = math.atan2(sy - cy, sx - cx)
+    a_end   = math.atan2(ey - cy, ex - cx)
+    diff = a_end - a_start
+    while diff > math.pi:
+        diff -= 2 * math.pi
+    while diff < -math.pi:
+        diff += 2 * math.pi
+    a_mid = a_start + diff / 2
+    return (cx + arc.radius * math.cos(a_mid),
+            cy + arc.radius * math.sin(a_mid))
 
 
-def _gen_loop_cq(loop: Loop, indent: str = "    ") -> list[str]:
-    """
-    Generate CadQuery sketch lines for a single loop.
-    Returns a list of code lines (without trailing newline).
-    """
+# ── Loop code generation ──────────────────────────────────────────────────────
+
+def _gen_loop_cq(ordered: list[OrderedCurve]) -> list[str]:
     lines = []
-    curves = loop.curves
 
-    if not curves:
-        return lines
-
-    # ── Circle ──────────────────────────────────────────────────────────────
-    if len(curves) == 1 and isinstance(curves[0], CurveCircle):
-        c = curves[0]
-        cx = c.center.x * 1000
-        cy = c.center.y * 1000
+    # Single circle
+    if len(ordered) == 1 and ordered[0].is_circle:
+        c = ordered[0]
+        cx, cy = c.center
         if abs(cx) > 1e-6 or abs(cy) > 1e-6:
-            lines.append(f"{indent}.transformed(offset=cq.Vector({cx:.4f}, {cy:.4f}, 0))")
-        lines.append(f"{indent}.circle({c.radius_mm:.4f})")
+            lines.append(f"    .moveTo({cx:.4f}, {cy:.4f})")
+        lines.append(f"    .circle({c.radius:.4f})")
         return lines
 
-    # ── Axis-aligned rectangle ───────────────────────────────────────────────
-    rect = _is_rect(curves)
+    # Axis-aligned rectangle
+    rect = detect_rectangle(ordered)
     if rect:
         cx, cy, w, h = rect
         if abs(cx) > 1e-6 or abs(cy) > 1e-6:
-            lines.append(f"{indent}.transformed(offset=cq.Vector({cx:.4f}, {cy:.4f}, 0))")
-        lines.append(f"{indent}.rect({w:.4f}, {h:.4f})")
+            lines.append(f"    .moveTo({cx:.4f}, {cy:.4f})")
+        lines.append(f"    .rect({w:.4f}, {h:.4f})")
         return lines
 
-    # ── Generic polyline ─────────────────────────────────────────────────────
-    # Collect ordered points from Line3D segments
-    if all(isinstance(c, CurveLine) for c in curves):
-        pts = [(c.start.x * 1000, c.start.y * 1000) for c in curves]
-        pts_str = ", ".join(f"({x:.4f}, {y:.4f})" for x, y in pts)
-        lines.append(f"{indent}.polyline([{pts_str}]).close()")
+    # Pure polygon
+    if is_polygon(ordered):
+        pts = ordered_points(ordered)
+        pts_closed = pts + [pts[0]]
+        pts_str = ", ".join(f"({x:.4f}, {y:.4f})" for x, y in pts_closed)
+        lines.append(f"    .polyline([{pts_str}]).close()")
         return lines
 
-    # ── Arc3D ────────────────────────────────────────────────────────────────
-    if len(curves) == 1 and isinstance(curves[0], CurveArc):
-        arc = curves[0]
-        sx, sy = arc.start.x * 1000, arc.start.y * 1000
-        ex, ey = arc.end.x * 1000,   arc.end.y * 1000
-        mx = (arc.center.x * 1000 + arc.radius_mm *
-              ((sx - arc.center.x * 1000) / max(arc.radius_mm, 1e-9)))
-        my = (arc.center.y * 1000 + arc.radius_mm *
-              ((sy - arc.center.y * 1000) / max(arc.radius_mm, 1e-9)))
-        lines.append(
-            f"{indent}.threePointArc(({sx:.4f}, {sy:.4f}), "
-            f"({mx:.4f}, {my:.4f}), ({ex:.4f}, {ey:.4f}))"
-        )
-        return lines
-
-    # ── Mixed curves fallback ────────────────────────────────────────────────
-    for curve in curves:
-        if isinstance(curve, CurveLine):
-            sx, sy = curve.start.x * 1000, curve.start.y * 1000
-            ex, ey = curve.end.x   * 1000, curve.end.y   * 1000
-            lines.append(f"{indent}.moveTo({sx:.4f}, {sy:.4f})")
-            lines.append(f"{indent}.lineTo({ex:.4f}, {ey:.4f})")
-        elif isinstance(curve, CurveArc):
-            sx, sy = curve.start.x * 1000, curve.start.y * 1000
-            ex, ey = curve.end.x   * 1000, curve.end.y   * 1000
-            cx, cy = curve.center.x * 1000, curve.center.y * 1000
+    # Mixed contour (lines + arcs)
+    first = ordered[0]
+    lines.append(f"    .moveTo({first.start[0]:.4f}, {first.start[1]:.4f})")
+    for seg in ordered:
+        if seg.is_circle:
+            continue
+        if seg.kind == "line":
+            lines.append(f"    .lineTo({seg.end[0]:.4f}, {seg.end[1]:.4f})")
+        elif seg.kind == "arc":
+            mx, my = _arc_midpoint(seg)
             lines.append(
-                f"{indent}.threePointArc(({sx:.4f}, {sy:.4f}), "
-                f"({cx:.4f}, {cy:.4f}), ({ex:.4f}, {ey:.4f}))"
+                f"    .threePointArc(({mx:.4f}, {my:.4f}), "
+                f"({seg.end[0]:.4f}, {seg.end[1]:.4f}))"
             )
-    if lines:
-        lines.append(f"{indent}.close()")
-
+    lines.append(f"    .close()")
     return lines
-
-
-# ── Operation helpers ─────────────────────────────────────────────────────────
-
-_CQ_OP_MAP = {
-    "new_body" : None,          # default — no combine kwarg needed
-    "join"     : "combine=True",
-    "cut"      : "combine='cut'",
-    "intersect": "combine='intersect'",
-}
 
 
 # ── Main generator ────────────────────────────────────────────────────────────
 
 def generate(model: CADModel) -> str:
-    """
-    Generate a CadQuery Python script from a CADModel.
-
-    Args:
-        model: parsed CADModel from parser.parse()
-
-    Returns:
-        A string containing the complete executable CadQuery script.
-    """
     code: list[str] = []
-
-    # Header
     code.append('"""')
     code.append(f'CadQuery script generated from {model.source_file}')
     code.append('Generated by CQB123 — github.com/zoom-BT/cqb123')
@@ -194,122 +118,95 @@ def generate(model: CADModel) -> str:
     code.append("import cadquery as cq")
     code.append("")
 
-    # Build a sketch registry: sketch_id → variable name
     sketch_vars: dict[str, str] = {}
-    sketch_counter = 0
-    result_var = "result"
-
-    # First pass — assign variable names to sketches
+    counter = 0
     for step in model.steps:
         if step.step_type == "sketch":
-            sketch_counter += 1
-            vname = f"sketch_{sketch_counter}"
-            sketch_vars[step.entity.entity_id] = vname
+            counter += 1
+            sketch_vars[step.entity.entity_id] = f"sketch_{counter}"
 
-    # Track whether we have a solid yet
     has_solid = False
+    result_var = "result"
 
-    # Second pass — generate code
     for step in model.steps:
 
-        # ── Sketch ──────────────────────────────────────────────────────────
         if step.step_type == "sketch":
             sketch: Sketch = step.entity
             vname = sketch_vars[sketch.entity_id]
             plane_str = _cq_plane(sketch.workplane)
 
+            body_lines = []
+            for profile in sketch.profiles.values():
+                for loop in profile.loops:
+                    ordered = order_loop(loop)
+                    if not is_closed(ordered):
+                        body_lines.append("    # WARNING: open contour skipped")
+                        continue
+                    body_lines.extend(_gen_loop_cq(ordered))
+
             if sketch.is_orphan:
                 code.append(f"# Orphan sketch '{sketch.name}' — not extruded")
                 code.append(f"# {vname} = (")
-                code.append(f'#     cq.Workplane({plane_str})')
-                for profile in sketch.profiles.values():
-                    for loop in profile.loops:
-                        for line in _gen_loop_cq(loop):
-                            code.append(f"#  {line.strip()}")
+                code.append(f"#     cq.Workplane({plane_str})")
+                for bl in body_lines:
+                    code.append(f"# {bl}")
                 code.append("# )")
                 code.append("")
                 continue
 
             code.append(f"{vname} = (")
             code.append(f"    cq.Workplane({plane_str})")
-
-            for profile in sketch.profiles.values():
-                for loop in profile.loops:
-                    loop_lines = _gen_loop_cq(loop)
-                    code.extend(loop_lines)
-
+            code.extend(body_lines)
             code.append(")")
             code.append("")
 
-        # ── Extrude ──────────────────────────────────────────────────────────
         elif step.step_type == "extrude":
             extrude: Extrude = step.entity
             op = extrude.operation
-            combine_kwarg = _CQ_OP_MAP.get(op)
+            dist = extrude.distance_mm
+            ref_ids = list(dict.fromkeys(
+                r.sketch_id for r in extrude.profile_refs))
+            both = ", both=True" if extrude.extent_type == "two_sides" else ""
 
-            # Collect unique referenced sketch ids in this extrude
-            ref_sketch_ids = list(dict.fromkeys(
-                r.sketch_id for r in extrude.profile_refs
-            ))
-
-            # Build extrude call
-            dist     = extrude.distance_mm
-            dist_two = extrude.distance_two_mm
-
-            if extrude.extent_type == "two_sides":
-                extrude_call = (
-                    f".extrude({dist:.4f}, both=True)"
-                )
-            else:
-                extrude_call = f".extrude({dist:.4f})"
-
-            if combine_kwarg:
-                extrude_call = extrude_call.replace(")", f", {combine_kwarg})")
-
-            for i, sketch_id in enumerate(ref_sketch_ids):
-                src_var = sketch_vars.get(sketch_id)
-                if src_var is None:
+            for sketch_id in ref_ids:
+                src = sketch_vars.get(sketch_id)
+                if src is None:
                     continue
 
                 if not has_solid and op == "new_body":
-                    # First solid — assign to result
                     code.append(f"{result_var} = (")
-                    code.append(f"    {src_var}")
-                    code.append(f"    {extrude_call}")
+                    code.append(f"    {src}")
+                    code.append(f"    .extrude({dist:.4f}{both})")
                     code.append(")")
                     has_solid = True
-                else:
-                    # Subsequent operations — union/cut/join onto result
+                elif op == "cut" and has_solid:
+                    code.append(f"{result_var} = {result_var}.cut("
+                                f"{src}.extrude({dist:.4f}{both}))")
+                elif op in ("join", "new_body") and has_solid:
+                    code.append(f"{result_var} = {result_var}.union("
+                                f"{src}.extrude({dist:.4f}{both}))")
+                elif op == "intersect" and has_solid:
+                    code.append(f"{result_var} = {result_var}.intersect("
+                                f"{src}.extrude({dist:.4f}{both}))")
+                elif not has_solid:
+                    # First solid even if not new_body
                     code.append(f"{result_var} = (")
-                    code.append(f"    {result_var}")
-                    code.append(f"    .union({src_var}{extrude_call})"
-                                 if op == "join" else
-                                 f"    .cut({src_var}{extrude_call})"
-                                 if op == "cut" else
-                                 f"    .union({src_var}{extrude_call})")
+                    code.append(f"    {src}")
+                    code.append(f"    .extrude({dist:.4f}{both})")
                     code.append(")")
-
+                    has_solid = True
                 code.append("")
 
-    # Footer — show result
     code.append("# Display")
-    if has_solid:
-        code.append(f"show_object({result_var})")
-    else:
-        code.append("# No solid generated")
-
+    code.append(f"show_object({result_var})" if has_solid
+                else "# No solid generated")
     return "\n".join(code)
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
     from parser import parse
-
     if len(sys.argv) < 2:
         print("Usage: python cadquery_gen.py <path_to_json>")
         sys.exit(1)
-
-    model = parse(sys.argv[1])
-    print(generate(model))
+    print(generate(parse(sys.argv[1])))

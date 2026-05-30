@@ -1,55 +1,36 @@
 """
-build123d_gen.py — Build123d code generator
+build123d_gen.py — Build123d code generator (V2)
 Converts a parsed CADModel into an executable Build123d Python script.
 
-Coverage (V1):
-  - Line3D   → polyline / Rectangle detection
-  - Circle3D → Circle
-  - Planes   → XY, XZ, XZ_neg, YZ, YZ_neg, XY_neg + custom fallback
-  - Operations → new_body, cut, join
-  - Extent   → one_side, two_sides
-  - Orphan sketches → commented out
-  - Multi-profile extrudes → multiple shapes in same BuildSketch context
+Uses loop_builder to order curves into continuous contours.
+Polygons are emitted with Polygon(...) instead of Polyline(...) which
+requires a BuildLine context. Mixed contours use a BuildLine block.
 """
 
 from __future__ import annotations
 from typing import Optional
 
-from parser import (
-    CADModel, Sketch, Extrude,
-    Profile, Loop, Curve,
-    CurveLine, CurveCircle, CurveArc,
-    Workplane, Vec3,
+from parser import CADModel, Sketch, Extrude, Workplane, Vec3
+from loop_builder import (
+    order_loop, is_closed, is_polygon,
+    detect_rectangle, ordered_points, OrderedCurve,
 )
 
 
 # ── Plane helpers ─────────────────────────────────────────────────────────────
 
-# Build123d standard Plane names
 _B3D_PLANE_MAP = {
-    "XY"     : "Plane.XY",
-    "XY_neg" : "Plane.XY.offset(-0)",   # handled via origin
-    "XZ"     : "Plane.XZ",
-    "XZ_neg" : "Plane.XZ",
-    "YZ"     : "Plane.YZ",
-    "YZ_neg" : "Plane.YZ",
+    "XY": "Plane.XY", "XY_neg": "Plane.XY",
+    "XZ": "Plane.XZ", "XZ_neg": "Plane.XZ",
+    "YZ": "Plane.YZ", "YZ_neg": "Plane.YZ",
 }
 
 
 def _b3d_plane(wp: Workplane) -> str:
-    """
-    Return the Build123d Plane expression for a workplane.
-    Standard cardinal planes → Plane.XY / Plane.XZ / Plane.YZ
-    Custom planes → Plane(origin=..., z_dir=...)
-    """
     name = wp.plane_name
-
     if name and not wp.has_nonzero_origin:
         return _B3D_PLANE_MAP[name]
-
-    # Custom plane or non-zero origin
-    o = wp.origin
-    z = wp.z_axis
+    o, z = wp.origin, wp.z_axis
     return (
         f"Plane("
         f"origin=({o.x*1000:.4f}, {o.y*1000:.4f}, {o.z*1000:.4f}), "
@@ -57,59 +38,43 @@ def _b3d_plane(wp: Workplane) -> str:
     )
 
 
-# ── Curve helpers ─────────────────────────────────────────────────────────────
+# ── Arc midpoint ──────────────────────────────────────────────────────────────
 
-def _is_rect(curves: list[Curve]) -> Optional[tuple[float, float, float, float]]:
-    """
-    Detect axis-aligned rectangle from 4 Line3D segments.
-    Returns (cx, cy, width, height) in mm, or None.
-    """
-    if len(curves) != 4:
-        return None
-    if not all(isinstance(c, CurveLine) for c in curves):
-        return None
-
-    xs, ys = set(), set()
-    for c in curves:
-        xs.update([round(c.start.x * 1000, 6), round(c.end.x * 1000, 6)])
-        ys.update([round(c.start.y * 1000, 6), round(c.end.y * 1000, 6)])
-
-    if len(xs) == 2 and len(ys) == 2:
-        x_vals = sorted(xs)
-        y_vals = sorted(ys)
-        w  = x_vals[1] - x_vals[0]
-        h  = y_vals[1] - y_vals[0]
-        cx = (x_vals[0] + x_vals[1]) / 2
-        cy = (y_vals[0] + y_vals[1]) / 2
-        return (cx, cy, w, h)
-    return None
+def _arc_midpoint(arc: OrderedCurve) -> tuple[float, float]:
+    import math
+    cx, cy = arc.center
+    sx, sy = arc.start
+    ex, ey = arc.end
+    a_start = math.atan2(sy - cy, sx - cx)
+    a_end   = math.atan2(ey - cy, ex - cx)
+    diff = a_end - a_start
+    while diff > math.pi:
+        diff -= 2 * math.pi
+    while diff < -math.pi:
+        diff += 2 * math.pi
+    a_mid = a_start + diff / 2
+    return (cx + arc.radius * math.cos(a_mid),
+            cy + arc.radius * math.sin(a_mid))
 
 
-def _gen_loop_b3d(loop: Loop, indent: str = "        ") -> list[str]:
-    """
-    Generate Build123d sketch lines for a single loop.
-    Returns a list of code lines ready to be indented inside a BuildSketch block.
-    """
+# ── Loop code generation ──────────────────────────────────────────────────────
+
+def _gen_loop_b3d(ordered: list[OrderedCurve], indent: str = "    ") -> list[str]:
     lines = []
-    curves = loop.curves
 
-    if not curves:
-        return lines
-
-    # ── Circle ───────────────────────────────────────────────────────────────
-    if len(curves) == 1 and isinstance(curves[0], CurveCircle):
-        c = curves[0]
-        cx = c.center.x * 1000
-        cy = c.center.y * 1000
+    # Single circle
+    if len(ordered) == 1 and ordered[0].is_circle:
+        c = ordered[0]
+        cx, cy = c.center
         if abs(cx) > 1e-6 or abs(cy) > 1e-6:
             lines.append(f"{indent}with Locations(({cx:.4f}, {cy:.4f})):")
-            lines.append(f"{indent}    Circle({c.radius_mm:.4f})")
+            lines.append(f"{indent}    Circle({c.radius:.4f})")
         else:
-            lines.append(f"{indent}Circle({c.radius_mm:.4f})")
+            lines.append(f"{indent}Circle({c.radius:.4f})")
         return lines
 
-    # ── Axis-aligned rectangle ────────────────────────────────────────────────
-    rect = _is_rect(curves)
+    # Axis-aligned rectangle
+    rect = detect_rectangle(ordered)
     if rect:
         cx, cy, w, h = rect
         if abs(cx) > 1e-6 or abs(cy) > 1e-6:
@@ -119,53 +84,45 @@ def _gen_loop_b3d(loop: Loop, indent: str = "        ") -> list[str]:
             lines.append(f"{indent}Rectangle({w:.4f}, {h:.4f})")
         return lines
 
-    # ── Generic polyline (Line3D segments) ────────────────────────────────────
-    if all(isinstance(c, CurveLine) for c in curves):
-        pts = [(c.start.x * 1000, c.start.y * 1000) for c in curves]
+    # Pure polygon → Polygon() (self-contained face)
+    if is_polygon(ordered):
+        pts = ordered_points(ordered)
         pts_str = ", ".join(f"({x:.4f}, {y:.4f})" for x, y in pts)
-        lines.append(f"{indent}Polyline([{pts_str}], close=True)")
+        lines.append(f"{indent}Polygon({pts_str})")
         return lines
 
-    # ── Arc3D ─────────────────────────────────────────────────────────────────
-    if len(curves) == 1 and isinstance(curves[0], CurveArc):
-        arc = curves[0]
-        sx, sy = arc.start.x  * 1000, arc.start.y  * 1000
-        ex, ey = arc.end.x    * 1000, arc.end.y    * 1000
-        cx, cy = arc.center.x * 1000, arc.center.y * 1000
-        lines.append(
-            f"{indent}ThreePointArc("
-            f"({sx:.4f}, {sy:.4f}), "
-            f"({cx:.4f}, {cy:.4f}), "
-            f"({ex:.4f}, {ey:.4f}))"
-        )
-        return lines
-
-    # ── Mixed curves fallback ─────────────────────────────────────────────────
-    for curve in curves:
-        if isinstance(curve, CurveLine):
-            sx, sy = curve.start.x * 1000, curve.start.y * 1000
-            ex, ey = curve.end.x   * 1000, curve.end.y   * 1000
-            lines.append(f"{indent}Line(({sx:.4f}, {sy:.4f}), ({ex:.4f}, {ey:.4f}))")
-        elif isinstance(curve, CurveArc):
-            sx, sy = curve.start.x  * 1000, curve.start.y  * 1000
-            ex, ey = curve.end.x    * 1000, curve.end.y    * 1000
-            cx, cy = curve.center.x * 1000, curve.center.y * 1000
+    # Mixed contour → BuildLine + make_face
+    lines.append(f"{indent}with BuildLine():")
+    first = ordered[0]
+    prev = first.start
+    for seg in ordered:
+        if seg.is_circle:
+            continue
+        if seg.kind == "line":
             lines.append(
-                f"{indent}ThreePointArc("
-                f"({sx:.4f}, {sy:.4f}), "
-                f"({cx:.4f}, {cy:.4f}), "
-                f"({ex:.4f}, {ey:.4f}))"
+                f"{indent}    Line(({prev[0]:.4f}, {prev[1]:.4f}), "
+                f"({seg.end[0]:.4f}, {seg.end[1]:.4f}))"
             )
-
+            prev = seg.end
+        elif seg.kind == "arc":
+            mx, my = _arc_midpoint(seg)
+            lines.append(
+                f"{indent}    ThreePointArc("
+                f"({prev[0]:.4f}, {prev[1]:.4f}), "
+                f"({mx:.4f}, {my:.4f}), "
+                f"({seg.end[0]:.4f}, {seg.end[1]:.4f}))"
+            )
+            prev = seg.end
+    lines.append(f"{indent}make_face()")
     return lines
 
 
-# ── Operation helpers ─────────────────────────────────────────────────────────
+# ── Mode map ──────────────────────────────────────────────────────────────────
 
 _B3D_MODE_MAP = {
-    "new_body" : "Mode.ADD",
-    "join"     : "Mode.ADD",
-    "cut"      : "Mode.SUBTRACT",
+    "new_body": "Mode.ADD",
+    "join":     "Mode.ADD",
+    "cut":      "Mode.SUBTRACT",
     "intersect": "Mode.INTERSECT",
 }
 
@@ -173,18 +130,7 @@ _B3D_MODE_MAP = {
 # ── Main generator ────────────────────────────────────────────────────────────
 
 def generate(model: CADModel) -> str:
-    """
-    Generate a Build123d Python script from a CADModel.
-
-    Args:
-        model: parsed CADModel from parser.parse()
-
-    Returns:
-        A string containing the complete executable Build123d script.
-    """
     code: list[str] = []
-
-    # Header
     code.append('"""')
     code.append(f'Build123d script generated from {model.source_file}')
     code.append('Generated by CQB123 — github.com/zoom-BT/cqb123')
@@ -192,100 +138,75 @@ def generate(model: CADModel) -> str:
     code.append("from build123d import *")
     code.append("")
 
-    # Map sketch entity_id → variable name
     sketch_vars: dict[str, str] = {}
-    sketch_counter = 0
+    counter = 0
     for step in model.steps:
         if step.step_type == "sketch":
-            sketch_counter += 1
-            sketch_vars[step.entity.entity_id] = f"sketch_{sketch_counter}"
+            counter += 1
+            sketch_vars[step.entity.entity_id] = f"sketch_{counter}"
 
     has_solid = False
 
     for step in model.steps:
 
-        # ── Sketch ───────────────────────────────────────────────────────────
         if step.step_type == "sketch":
             sketch: Sketch = step.entity
-            vname     = sketch_vars[sketch.entity_id]
+            vname = sketch_vars[sketch.entity_id]
             plane_str = _b3d_plane(sketch.workplane)
+
+            body_lines = []
+            for profile in sketch.profiles.values():
+                for loop in profile.loops:
+                    ordered = order_loop(loop)
+                    if not is_closed(ordered):
+                        body_lines.append("    # WARNING: open contour skipped")
+                        continue
+                    body_lines.extend(_gen_loop_b3d(ordered))
 
             if sketch.is_orphan:
                 code.append(f"# Orphan sketch '{sketch.name}' — not extruded")
                 code.append(f"# with BuildSketch({plane_str}) as {vname}:")
-                for profile in sketch.profiles.values():
-                    for loop in profile.loops:
-                        for line in _gen_loop_b3d(loop):
-                            code.append(f"#  {line.strip()}")
+                for bl in body_lines:
+                    code.append(f"# {bl}")
                 code.append("")
                 continue
 
             code.append(f"with BuildSketch({plane_str}) as {vname}:")
-
-            for profile in sketch.profiles.values():
-                for loop in profile.loops:
-                    loop_lines = _gen_loop_b3d(loop)
-                    code.extend(loop_lines)
-
+            code.extend(body_lines)
             code.append("")
 
-        # ── Extrude ──────────────────────────────────────────────────────────
         elif step.step_type == "extrude":
             extrude: Extrude = step.entity
-            op   = extrude.operation
+            op = extrude.operation
             mode = _B3D_MODE_MAP.get(op, "Mode.ADD")
             dist = extrude.distance_mm
+            ref_ids = list(dict.fromkeys(
+                r.sketch_id for r in extrude.profile_refs))
 
-            # Collect unique referenced sketch variables
-            ref_sketch_ids = list(dict.fromkeys(
-                r.sketch_id for r in extrude.profile_refs
-            ))
-
-            if not has_solid and op == "new_body":
-                # First solid — open the BuildPart context
+            if not has_solid:
                 code.append("with BuildPart() as part:")
                 has_solid = True
 
-            for sketch_id in ref_sketch_ids:
-                src_var = sketch_vars.get(sketch_id)
-                if src_var is None:
+            for sketch_id in ref_ids:
+                src = sketch_vars.get(sketch_id)
+                if src is None:
                     continue
+                code.append(f"    add({src}.sketch)")
 
-                # Add sketch into the part context
-                code.append(f"    add({src_var}.sketch)")
-
-            # Extrude inside the part context
-            if extrude.extent_type == "two_sides":
-                code.append(
-                    f"    extrude(amount={dist:.4f}, "
-                    f"both=True, mode={mode})"
-                )
-            else:
-                code.append(
-                    f"    extrude(amount={dist:.4f}, mode={mode})"
-                )
-
+            both = "both=True, " if extrude.extent_type == "two_sides" else ""
+            code.append(f"    extrude(amount={dist:.4f}, {both}mode={mode})")
             code.append("")
 
-    # Footer
     code.append("# Display")
-    if has_solid:
-        code.append("show_object(part.part)")
-    else:
-        code.append("# No solid generated")
-
+    code.append("show_object(part.part)" if has_solid
+                else "# No solid generated")
     return "\n".join(code)
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
     from parser import parse
-
     if len(sys.argv) < 2:
         print("Usage: python build123d_gen.py <path_to_json>")
         sys.exit(1)
-
-    model = parse(sys.argv[1])
-    print(generate(model))
+    print(generate(parse(sys.argv[1])))
