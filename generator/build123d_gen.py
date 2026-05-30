@@ -145,57 +145,64 @@ def generate(model: CADModel) -> str:
             counter += 1
             sketch_vars[step.entity.entity_id] = f"sketch_{counter}"
 
-    has_solid = False
-
+    # ── Phase 1 : emit all sketches (outside any BuildPart) ───────────────────
     for step in model.steps:
+        if step.step_type != "sketch":
+            continue
+        sketch: Sketch = step.entity
+        vname = sketch_vars[sketch.entity_id]
+        plane_str = _b3d_plane(sketch.workplane)
 
-        if step.step_type == "sketch":
-            sketch: Sketch = step.entity
-            vname = sketch_vars[sketch.entity_id]
-            plane_str = _b3d_plane(sketch.workplane)
+        body_lines = []
+        for profile in sketch.profiles.values():
+            for loop in profile.loops:
+                ordered = order_loop(loop)
+                if not is_closed(ordered):
+                    body_lines.append("    # WARNING: open contour skipped")
+                    continue
+                body_lines.extend(_gen_loop_b3d(ordered))
 
-            body_lines = []
-            for profile in sketch.profiles.values():
-                for loop in profile.loops:
-                    ordered = order_loop(loop)
-                    if not is_closed(ordered):
-                        body_lines.append("    # WARNING: open contour skipped")
-                        continue
-                    body_lines.extend(_gen_loop_b3d(ordered))
-
-            if sketch.is_orphan:
-                code.append(f"# Orphan sketch '{sketch.name}' — not extruded")
-                code.append(f"# with BuildSketch({plane_str}) as {vname}:")
-                for bl in body_lines:
-                    code.append(f"# {bl}")
-                code.append("")
-                continue
-
-            code.append(f"with BuildSketch({plane_str}) as {vname}:")
-            code.extend(body_lines)
+        if sketch.is_orphan:
+            code.append(f"# Orphan sketch '{sketch.name}' — not extruded")
+            code.append(f"# with BuildSketch({plane_str}) as {vname}:")
+            for bl in body_lines:
+                code.append(f"# {bl}")
             code.append("")
+            continue
 
-        elif step.step_type == "extrude":
-            extrude: Extrude = step.entity
+        code.append(f"with BuildSketch({plane_str}) as {vname}:")
+        code.extend(body_lines)
+        code.append("")
+
+    # ── Phase 2 : single BuildPart with all extrudes ──────────────────────────
+    extrude_steps = [s for s in model.steps if s.step_type == "extrude"]
+    # Filter extrudes that reference a non-orphan, existing sketch
+    valid_extrudes = []
+    orphan_ids = {s.entity_id for s in model.sketches if s.is_orphan}
+    for step in extrude_steps:
+        refs = [r for r in step.entity.profile_refs
+                if r.sketch_id in sketch_vars
+                and r.sketch_id not in orphan_ids]
+        if refs:
+            valid_extrudes.append((step.entity, refs))
+
+    has_solid = bool(valid_extrudes)
+
+    if has_solid:
+        code.append("with BuildPart() as part:")
+        for extrude, refs in valid_extrudes:
             op = extrude.operation
             mode = _B3D_MODE_MAP.get(op, "Mode.ADD")
             dist = extrude.distance_mm
-            ref_ids = list(dict.fromkeys(
-                r.sketch_id for r in extrude.profile_refs))
-
-            if not has_solid:
-                code.append("with BuildPart() as part:")
-                has_solid = True
-
-            for sketch_id in ref_ids:
-                src = sketch_vars.get(sketch_id)
-                if src is None:
-                    continue
-                code.append(f"    add({src}.sketch)")
-
             both = "both=True, " if extrude.extent_type == "two_sides" else ""
-            code.append(f"    extrude(amount={dist:.4f}, {both}mode={mode})")
-            code.append("")
+            ref_ids = list(dict.fromkeys(r.sketch_id for r in refs))
+            for sketch_id in ref_ids:
+                src = sketch_vars[sketch_id]
+                code.append(
+                    f"    extrude({src}.sketch, amount={dist:.4f}, "
+                    f"{both}mode={mode})"
+                )
+        code.append("")
 
     code.append("# Display")
     code.append("show_object(part.part)" if has_solid
