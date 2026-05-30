@@ -60,51 +60,50 @@ def _arc_midpoint(arc: OrderedCurve) -> tuple[float, float]:
 
 # ── Loop code generation ──────────────────────────────────────────────────────
 
-def _gen_loop_cq(ordered: list[OrderedCurve]) -> list[str]:
-    lines = []
-
+def _gen_single_loop(ordered: list[OrderedCurve], plane_str: str) -> str:
+    """
+    Build ONE closed contour as a complete cq.Workplane(...) expression.
+    Returns a single-line (or multi-line) expression string.
+    Each contour is self-contained so multiple contours never collide.
+    """
     # Single circle
     if len(ordered) == 1 and ordered[0].is_circle:
         c = ordered[0]
         cx, cy = c.center
-        if abs(cx) > 1e-6 or abs(cy) > 1e-6:
-            lines.append(f"    .moveTo({cx:.4f}, {cy:.4f})")
-        lines.append(f"    .circle({c.radius:.4f})")
-        return lines
+        move = f".moveTo({cx:.4f}, {cy:.4f})" if (abs(cx) > 1e-6 or abs(cy) > 1e-6) else ""
+        return f"cq.Workplane({plane_str}){move}.circle({c.radius:.4f})"
 
-    # Axis-aligned rectangle
+    # Rectangle
     rect = detect_rectangle(ordered)
     if rect:
         cx, cy, w, h = rect
-        if abs(cx) > 1e-6 or abs(cy) > 1e-6:
-            lines.append(f"    .moveTo({cx:.4f}, {cy:.4f})")
-        lines.append(f"    .rect({w:.4f}, {h:.4f})")
-        return lines
+        move = f".moveTo({cx:.4f}, {cy:.4f})" if (abs(cx) > 1e-6 or abs(cy) > 1e-6) else ""
+        return f"cq.Workplane({plane_str}){move}.rect({w:.4f}, {h:.4f})"
 
     # Pure polygon
     if is_polygon(ordered):
         pts = ordered_points(ordered)
         pts_closed = pts + [pts[0]]
         pts_str = ", ".join(f"({x:.4f}, {y:.4f})" for x, y in pts_closed)
-        lines.append(f"    .polyline([{pts_str}]).close()")
-        return lines
+        return f"cq.Workplane({plane_str}).polyline([{pts_str}]).close()"
 
     # Mixed contour (lines + arcs)
+    parts = [f"cq.Workplane({plane_str})"]
     first = ordered[0]
-    lines.append(f"    .moveTo({first.start[0]:.4f}, {first.start[1]:.4f})")
+    parts.append(f".moveTo({first.start[0]:.4f}, {first.start[1]:.4f})")
     for seg in ordered:
         if seg.is_circle:
             continue
         if seg.kind == "line":
-            lines.append(f"    .lineTo({seg.end[0]:.4f}, {seg.end[1]:.4f})")
+            parts.append(f".lineTo({seg.end[0]:.4f}, {seg.end[1]:.4f})")
         elif seg.kind == "arc":
             mx, my = _arc_midpoint(seg)
-            lines.append(
-                f"    .threePointArc(({mx:.4f}, {my:.4f}), "
+            parts.append(
+                f".threePointArc(({mx:.4f}, {my:.4f}), "
                 f"({seg.end[0]:.4f}, {seg.end[1]:.4f}))"
             )
-    lines.append(f"    .close()")
-    return lines
+    parts.append(".close()")
+    return "".join(parts)
 
 
 # ── Main generator ────────────────────────────────────────────────────────────
@@ -135,29 +134,33 @@ def generate(model: CADModel) -> str:
             vname = sketch_vars[sketch.entity_id]
             plane_str = _cq_plane(sketch.workplane)
 
-            body_lines = []
+            # Build each closed contour as a separate expression
+            contour_exprs = []
             for profile in sketch.profiles.values():
                 for loop in profile.loops:
                     ordered = order_loop(loop)
                     if not is_closed(ordered):
-                        body_lines.append("    # WARNING: open contour skipped")
                         continue
-                    body_lines.extend(_gen_loop_cq(ordered))
+                    contour_exprs.append(_gen_single_loop(ordered, plane_str))
+
+            if not contour_exprs:
+                contour_exprs = [f"cq.Workplane({plane_str})"]
 
             if sketch.is_orphan:
                 code.append(f"# Orphan sketch '{sketch.name}' — not extruded")
-                code.append(f"# {vname} = (")
-                code.append(f"#     cq.Workplane({plane_str})")
-                for bl in body_lines:
-                    code.append(f"# {bl}")
-                code.append("# )")
+                code.append(f"# {vname} = {contour_exprs[0]}")
                 code.append("")
                 continue
 
-            code.append(f"{vname} = (")
-            code.append(f"    cq.Workplane({plane_str})")
-            code.extend(body_lines)
-            code.append(")")
+            # First contour is the base; subsequent ones added as wires
+            if len(contour_exprs) == 1:
+                code.append(f"{vname} = {contour_exprs[0]}")
+            else:
+                code.append(f"{vname} = (")
+                code.append(f"    {contour_exprs[0]}")
+                for expr in contour_exprs[1:]:
+                    code.append(f"    .add({expr})")
+                code.append(")")
             code.append("")
 
         elif step.step_type == "extrude":
