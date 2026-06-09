@@ -107,12 +107,21 @@ def _sample_occ(wrapped, n_points: int = 256, deflection: float = 1.0):
     """
     Sample surface points from an OCCT shape using a COARSE mesh.
     deflection=1.0 keeps meshing fast even for complex parts.
+    Uses OCP (cadquery 2.7+ / build123d) with OCC.Core fallback.
     """
     try:
-        from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
-        from OCC.Core.TopExp import TopExp_Explorer
-        from OCC.Core.TopAbs import TopAbs_FACE
-        from OCC.Core.BRep import BRep_Tool
+        try:
+            from OCP.BRepMesh import BRepMesh_IncrementalMesh
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_FACE
+            from OCP.BRep import BRep_Tool
+            from OCP.TopLoc import TopLoc_Location
+        except ImportError:
+            from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+            from OCC.Core.TopExp import TopExp_Explorer
+            from OCC.Core.TopAbs import TopAbs_FACE
+            from OCC.Core.BRep import BRep_Tool
+            from OCC.Core.TopLoc import TopLoc_Location
 
         BRepMesh_IncrementalMesh(wrapped, deflection).Perform()
 
@@ -120,7 +129,7 @@ def _sample_occ(wrapped, n_points: int = 256, deflection: float = 1.0):
         exp = TopExp_Explorer(wrapped, TopAbs_FACE)
         while exp.More():
             face = exp.Current()
-            loc = BRep_Tool.Location_s(face)
+            loc = TopLoc_Location()
             tri = BRep_Tool.Triangulation_s(face, loc)
             if tri is not None:
                 for i in range(1, tri.NbNodes() + 1):
