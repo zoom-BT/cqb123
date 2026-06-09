@@ -136,17 +136,20 @@ def generate(model: CADModel) -> str:
             vname = sketch_vars[sketch.entity_id]
             plane_str = _cq_plane(sketch.workplane)
 
-            # Gather and classify all loops (solid vs hole) across profiles
-            all_ordered = []
+            # Classify loops per-profile (a hole belongs to its own profile)
+            solids, holes = [], []
             for profile in sketch.profiles.values():
+                prof_ordered = []
                 for loop in profile.loops:
                     ordered = order_loop(loop)
                     if is_closed(ordered):
-                        all_ordered.append(ordered)
-
-            classified = classify_loops(all_ordered) if all_ordered else []
-            solids = [c["contour"] for c in classified if not c["is_hole"]]
-            holes  = [c["contour"] for c in classified if c["is_hole"]]
+                        prof_ordered.append(ordered)
+                classified = classify_loops(prof_ordered) if prof_ordered else []
+                for c in classified:
+                    if c["is_hole"]:
+                        holes.append(c["contour"])
+                    else:
+                        solids.append(c["contour"])
 
             solid_exprs = [_gen_single_loop(o, plane_str) for o in solids]
             hole_exprs  = [_gen_single_loop(o, plane_str) for o in holes]

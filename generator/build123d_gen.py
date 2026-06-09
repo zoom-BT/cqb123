@@ -154,31 +154,27 @@ def generate(model: CADModel) -> str:
         vname = sketch_vars[sketch.entity_id]
         plane_str = _b3d_plane(sketch.workplane)
 
-        # Classify loops as solid vs hole by spatial nesting
-        all_ordered = []
+        # Classify loops per-profile (a hole belongs to its own profile)
+        body_lines = []
         for profile in sketch.profiles.values():
+            prof_ordered = []
             for loop in profile.loops:
                 ordered = order_loop(loop)
                 if is_closed(ordered):
-                    all_ordered.append(ordered)
-
-        classified = classify_loops(all_ordered) if all_ordered else []
-
-        body_lines = []
-        for c in classified:
-            loop_code = _gen_loop_b3d(c["contour"])
-            if c["is_hole"]:
-                # Holes subtract from the sketch
-                for ln in loop_code:
-                    # Inject mode=Mode.SUBTRACT into the shape call
-                    if ln.strip().startswith(("Circle", "Rectangle",
-                                              "Polygon", "make_face")):
-                        ln = ln.rstrip(")")
-                        sep = "" if ln.endswith("(") else ", "
-                        ln = ln + sep + "mode=Mode.SUBTRACT)"
-                    body_lines.append(ln)
-            else:
-                body_lines.extend(loop_code)
+                    prof_ordered.append(ordered)
+            classified = classify_loops(prof_ordered) if prof_ordered else []
+            for c in classified:
+                loop_code = _gen_loop_b3d(c["contour"])
+                if c["is_hole"]:
+                    for ln in loop_code:
+                        if ln.strip().startswith(("Circle", "Rectangle",
+                                                  "Polygon", "make_face")):
+                            ln = ln.rstrip(")")
+                            sep = "" if ln.endswith("(") else ", "
+                            ln = ln + sep + "mode=Mode.SUBTRACT)"
+                        body_lines.append(ln)
+                else:
+                    body_lines.extend(loop_code)
 
         if not body_lines:
             body_lines = ["    pass"]
