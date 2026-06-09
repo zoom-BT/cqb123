@@ -270,35 +270,59 @@ def validate_batch(
     b3d_total = 0
     chamfer_vals = []
 
-    with open(output, "w", encoding="utf-8") as out_f:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(_worker, t): t for t in tasks}
-            done = 0
-            for fut in as_completed(futures):
-                try:
-                    r = fut.result(timeout=timeout + 10)
-                except Exception:
-                    r = ValidationResult(
-                        file_id="?", cq_ok=False, b3d_ok=False,
-                        both_ok=False, cq_error="pool_error",
-                        b3d_error="pool_error", chamfer_mm=-1.0,
-                        n_points=0, status="error")
-                done += 1
-                counters[r.status] += 1
-                if r.cq_ok:
-                    cq_total += 1
-                if r.b3d_ok:
-                    b3d_total += 1
-                if r.chamfer_mm >= 0:
-                    chamfer_vals.append(r.chamfer_mm)
-                out_f.write(json.dumps(asdict(r)) + "\n")
+    def _record(r, out_f):
+        nonlocal cq_total, b3d_total
+        counters[r.status] += 1
+        if r.cq_ok:
+            cq_total += 1
+        if r.b3d_ok:
+            b3d_total += 1
+        if r.chamfer_mm >= 0:
+            chamfer_vals.append(r.chamfer_mm)
+        out_f.write(json.dumps(asdict(r)) + "\n")
 
-                if done % 100 == 0 or done == n:
-                    print(f"  [{done:6,}/{n:6,}]  "
-                          f"both={counters['ok']:,}  "
-                          f"cq={cq_total:,}  b3d={b3d_total:,}  "
-                          f"err={counters['error']:,}  "
-                          f"timeout={counters['timeout']:,}")
+    # Process in chunks so a crashed worker only loses its chunk,
+    # not the whole batch. A fresh executor is created per chunk.
+    CHUNK = 500
+    done = 0
+
+    with open(output, "w", encoding="utf-8") as out_f:
+        for chunk_start in range(0, n, CHUNK):
+            chunk = tasks[chunk_start:chunk_start + CHUNK]
+            try:
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    futures = {ex.submit(_worker, t): t for t in chunk}
+                    for fut in as_completed(futures):
+                        try:
+                            r = fut.result(timeout=timeout + 10)
+                        except Exception:
+                            t = futures[fut]
+                            r = ValidationResult(
+                                file_id=t[2], cq_ok=False, b3d_ok=False,
+                                both_ok=False, cq_error="worker_error",
+                                b3d_error="worker_error", chamfer_mm=-1.0,
+                                n_points=0, status="error")
+                        _record(r, out_f)
+                        done += 1
+            except Exception:
+                # Whole chunk pool died → fall back to sequential for this chunk
+                for t in chunk:
+                    try:
+                        r = _worker(t)
+                    except Exception:
+                        r = ValidationResult(
+                            file_id=t[2], cq_ok=False, b3d_ok=False,
+                            both_ok=False, cq_error="seq_error",
+                            b3d_error="seq_error", chamfer_mm=-1.0,
+                            n_points=0, status="error")
+                    _record(r, out_f)
+                    done += 1
+
+            pct = done / n * 100
+            print(f"  [{done:6,}/{n:6,}]  {pct:5.1f}%  "
+                  f"both={counters['ok']:,}  "
+                  f"cq={cq_total:,}  b3d={b3d_total:,}  "
+                  f"err={counters['error']:,}")
 
     # Report
     print(f"\n{'='*55}")
