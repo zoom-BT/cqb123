@@ -116,24 +116,27 @@ def _sample_occ(wrapped, n_points: int = 256, deflection: float = 1.0):
             from OCP.TopAbs import TopAbs_FACE
             from OCP.BRep import BRep_Tool
             from OCP.TopLoc import TopLoc_Location
+            from OCP.TopoDS import TopoDS
         except ImportError:
             from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
             from OCC.Core.TopExp import TopExp_Explorer
             from OCC.Core.TopAbs import TopAbs_FACE
             from OCC.Core.BRep import BRep_Tool
             from OCC.Core.TopLoc import TopLoc_Location
+            from OCC.Core.TopoDS import TopoDS
 
         BRepMesh_IncrementalMesh(wrapped, deflection).Perform()
 
         pts = []
         exp = TopExp_Explorer(wrapped, TopAbs_FACE)
         while exp.More():
-            face = exp.Current()
+            face = TopoDS.Face_s(exp.Current())
             loc = TopLoc_Location()
             tri = BRep_Tool.Triangulation_s(face, loc)
             if tri is not None:
+                trsf = loc.Transformation()
                 for i in range(1, tri.NbNodes() + 1):
-                    node = tri.Node(i)
+                    node = tri.Node(i).Transformed(trsf)
                     pts.append([node.X(), node.Y(), node.Z()])
             exp.Next()
 
