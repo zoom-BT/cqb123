@@ -189,3 +189,90 @@ def detect_rectangle(ordered: list[OrderedCurve]
         cy = (ys[0] + ys[1]) / 2
         return (cx, cy, w, h)
     return None
+
+
+# ── Nesting detection (holes) ─────────────────────────────────────────────────
+
+def contour_centroid(ordered: list[OrderedCurve]) -> tuple[float, float]:
+    """Approximate centroid of a contour (mm)."""
+    pts = []
+    for c in ordered:
+        if c.is_circle:
+            return c.center
+        pts.append(c.start)
+    if not pts:
+        return (0.0, 0.0)
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    return (cx, cy)
+
+
+def contour_area(ordered: list[OrderedCurve]) -> float:
+    """Approximate absolute area of a contour (mm^2)."""
+    import math
+    if len(ordered) == 1 and ordered[0].is_circle:
+        return math.pi * ordered[0].radius ** 2
+    pts = [c.start for c in ordered if not c.is_circle]
+    if len(pts) < 3:
+        return 0.0
+    # Shoelace formula
+    area = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2
+
+
+def point_in_contour(pt: tuple, ordered: list[OrderedCurve]) -> bool:
+    """Ray-casting point-in-polygon test. For circles, distance check."""
+    import math
+    if len(ordered) == 1 and ordered[0].is_circle:
+        c = ordered[0]
+        d = math.hypot(pt[0] - c.center[0], pt[1] - c.center[1])
+        return d < c.radius
+    pts = [c.start for c in ordered if not c.is_circle]
+    if len(pts) < 3:
+        return False
+    x, y = pt
+    inside = False
+    n = len(pts)
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if ((yi > y) != (yj > y)) and \
+           (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def classify_loops(loops_ordered: list[list[OrderedCurve]]) -> list[dict]:
+    """
+    Given a list of ordered contours from ONE profile, classify each as
+    outer (solid) or inner (hole) based on spatial nesting.
+
+    Returns a list of dicts: {"contour": ordered, "is_hole": bool}
+    A contour is a hole if its centroid lies inside a larger contour.
+    """
+    # Sort by area descending — largest first
+    indexed = [(i, c, contour_area(c)) for i, c in enumerate(loops_ordered)]
+    indexed.sort(key=lambda t: t[2], reverse=True)
+
+    result = [{"contour": c, "is_hole": False} for _, c, _ in indexed]
+
+    for a in range(len(indexed)):
+        for b in range(len(indexed)):
+            if a == b:
+                continue
+            # is contour b inside contour a (a larger than b)?
+            if indexed[a][2] <= indexed[b][2]:
+                continue
+            centroid_b = contour_centroid(indexed[b][1])
+            if point_in_contour(centroid_b, indexed[a][1]):
+                # b is nested inside a → b is a hole
+                result[b]["is_hole"] = True
+
+    return result

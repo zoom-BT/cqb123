@@ -14,6 +14,7 @@ from parser import CADModel, Sketch, Extrude, Workplane, Vec3
 from loop_builder import (
     order_loop, is_closed, is_polygon,
     detect_rectangle, ordered_points, OrderedCurve,
+    classify_loops,
 )
 
 
@@ -153,14 +154,34 @@ def generate(model: CADModel) -> str:
         vname = sketch_vars[sketch.entity_id]
         plane_str = _b3d_plane(sketch.workplane)
 
-        body_lines = []
+        # Classify loops as solid vs hole by spatial nesting
+        all_ordered = []
         for profile in sketch.profiles.values():
             for loop in profile.loops:
                 ordered = order_loop(loop)
-                if not is_closed(ordered):
-                    body_lines.append("    # WARNING: open contour skipped")
-                    continue
-                body_lines.extend(_gen_loop_b3d(ordered))
+                if is_closed(ordered):
+                    all_ordered.append(ordered)
+
+        classified = classify_loops(all_ordered) if all_ordered else []
+
+        body_lines = []
+        for c in classified:
+            loop_code = _gen_loop_b3d(c["contour"])
+            if c["is_hole"]:
+                # Holes subtract from the sketch
+                for ln in loop_code:
+                    # Inject mode=Mode.SUBTRACT into the shape call
+                    if ln.strip().startswith(("Circle", "Rectangle",
+                                              "Polygon", "make_face")):
+                        ln = ln.rstrip(")")
+                        sep = "" if ln.endswith("(") else ", "
+                        ln = ln + sep + "mode=Mode.SUBTRACT)"
+                    body_lines.append(ln)
+            else:
+                body_lines.extend(loop_code)
+
+        if not body_lines:
+            body_lines = ["    pass"]
 
         if sketch.is_orphan:
             code.append(f"# Orphan sketch '{sketch.name}' — not extruded")

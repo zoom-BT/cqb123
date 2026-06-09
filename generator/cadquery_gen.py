@@ -13,6 +13,7 @@ from parser import CADModel, Sketch, Extrude, Workplane, Vec3
 from loop_builder import (
     order_loop, is_closed, is_polygon,
     detect_rectangle, ordered_points, OrderedCurve,
+    classify_loops,
 )
 
 
@@ -126,6 +127,7 @@ def generate(model: CADModel) -> str:
 
     has_solid = False
     result_var = "result"
+    sketch_holes: dict[str, list] = {}
 
     for step in model.steps:
 
@@ -134,33 +136,54 @@ def generate(model: CADModel) -> str:
             vname = sketch_vars[sketch.entity_id]
             plane_str = _cq_plane(sketch.workplane)
 
-            # Build each closed contour as a separate expression
-            contour_exprs = []
+            # Gather and classify all loops (solid vs hole) across profiles
+            all_ordered = []
             for profile in sketch.profiles.values():
                 for loop in profile.loops:
                     ordered = order_loop(loop)
-                    if not is_closed(ordered):
-                        continue
-                    contour_exprs.append(_gen_single_loop(ordered, plane_str))
+                    if is_closed(ordered):
+                        all_ordered.append(ordered)
 
-            if not contour_exprs:
-                contour_exprs = [f"cq.Workplane({plane_str})"]
+            classified = classify_loops(all_ordered) if all_ordered else []
+            solids = [c["contour"] for c in classified if not c["is_hole"]]
+            holes  = [c["contour"] for c in classified if c["is_hole"]]
+
+            solid_exprs = [_gen_single_loop(o, plane_str) for o in solids]
+            hole_exprs  = [_gen_single_loop(o, plane_str) for o in holes]
+
+            if not solid_exprs:
+                solid_exprs = [f"cq.Workplane({plane_str})"]
 
             if sketch.is_orphan:
                 code.append(f"# Orphan sketch '{sketch.name}' — not extruded")
-                code.append(f"# {vname} = {contour_exprs[0]}")
+                code.append(f"# {vname} = {solid_exprs[0]}")
                 code.append("")
+                # store empty hole list
+                sketch_holes[sketch.entity_id] = []
                 continue
 
-            # First contour is the base; subsequent ones added as wires
-            if len(contour_exprs) == 1:
-                code.append(f"{vname} = {contour_exprs[0]}")
+            # Combine solid contours
+            if len(solid_exprs) == 1:
+                code.append(f"{vname} = {solid_exprs[0]}")
             else:
                 code.append(f"{vname} = (")
-                code.append(f"    {contour_exprs[0]}")
-                for expr in contour_exprs[1:]:
+                code.append(f"    {solid_exprs[0]}")
+                for expr in solid_exprs[1:]:
                     code.append(f"    .add({expr})")
                 code.append(")")
+
+            # Store hole expressions for the extrude step to cut
+            sketch_holes[sketch.entity_id] = hole_exprs
+            if hole_exprs:
+                hvar = f"{vname}_holes"
+                if len(hole_exprs) == 1:
+                    code.append(f"{hvar} = {hole_exprs[0]}")
+                else:
+                    code.append(f"{hvar} = (")
+                    code.append(f"    {hole_exprs[0]}")
+                    for expr in hole_exprs[1:]:
+                        code.append(f"    .add({expr})")
+                    code.append(")")
             code.append("")
 
         elif step.step_type == "extrude":
@@ -175,6 +198,9 @@ def generate(model: CADModel) -> str:
                 src = sketch_vars.get(sketch_id)
                 if src is None:
                     continue
+
+                has_holes = bool(sketch_holes.get(sketch_id))
+                hvar = f"{src}_holes"
 
                 if not has_solid and op == "new_body":
                     code.append(f"{result_var} = (")
@@ -192,12 +218,16 @@ def generate(model: CADModel) -> str:
                     code.append(f"{result_var} = {result_var}.intersect("
                                 f"{src}.extrude({dist:.4f}{both}))")
                 elif not has_solid:
-                    # First solid even if not new_body
                     code.append(f"{result_var} = (")
                     code.append(f"    {src}")
                     code.append(f"    .extrude({dist:.4f}{both})")
                     code.append(")")
                     has_solid = True
+
+                # Cut any holes belonging to this sketch
+                if has_holes and op != "cut":
+                    code.append(f"{result_var} = {result_var}.cut("
+                                f"{hvar}.extrude({dist:.4f}{both}))")
                 code.append("")
 
     code.append("# Display")
