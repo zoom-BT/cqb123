@@ -247,11 +247,13 @@ def validate_batch(
     dataset_dir: str,
     output_path: str,
     limit: Optional[int] = None,
+    offset: int = 0,
     workers: int = 4,
     compute_chamfer: bool = False,
     n_points: int = 256,
     timeout: int = 15,
     split_filter: Optional[str] = None,
+    resume: bool = False,
 ) -> dict:
 
     dataset = Path(dataset_dir)
@@ -263,13 +265,36 @@ def validate_batch(
     entries = [e for e in entries if e["status"] == "ok"]
     if split_filter:
         entries = [e for e in entries if e["split"] == split_filter]
+
+    # Apply offset/limit window (for batch processing)
+    if offset:
+        entries = entries[offset:]
     if limit:
         entries = entries[:limit]
+
+    # Resume: skip file_ids already present in the output file
+    already_done = set()
+    if resume and output.exists():
+        with open(output, encoding="utf-8") as f:
+            for l in f:
+                if l.strip():
+                    try:
+                        already_done.add(json.loads(l)["file_id"])
+                    except Exception:
+                        pass
+        before = len(entries)
+        entries = [e for e in entries if e["file_id"] not in already_done]
+        print(f"Resume: {len(already_done):,} already done, "
+              f"{len(entries):,} remaining (of {before:,})")
 
     n = len(entries)
     mode = "compile + chamfer" if compute_chamfer else "compile only"
     print(f"Validating {n:,} pairs  ({mode}, workers={workers}, "
           f"timeout={timeout}s)")
+
+    if n == 0:
+        print("Nothing to do.")
+        return {"n": 0}
 
     tasks = [
         (str(dataset / e["cq_path"]), str(dataset / e["b3d_path"]),
@@ -282,6 +307,9 @@ def validate_batch(
     b3d_total = 0
     chamfer_vals = []
 
+    # Append mode when resuming, write mode otherwise
+    file_mode = "a" if (resume and output.exists()) else "w"
+
     def _record(r, out_f):
         nonlocal cq_total, b3d_total
         counters[r.status] += 1
@@ -292,13 +320,14 @@ def validate_batch(
         if r.chamfer_mm >= 0:
             chamfer_vals.append(r.chamfer_mm)
         out_f.write(json.dumps(asdict(r)) + "\n")
+        out_f.flush()
 
     # Process in chunks so a crashed worker only loses its chunk,
     # not the whole batch. A fresh executor is created per chunk.
     CHUNK = 500
     done = 0
 
-    with open(output, "w", encoding="utf-8") as out_f:
+    with open(output, file_mode, encoding="utf-8") as out_f:
         for chunk_start in range(0, n, CHUNK):
             chunk = tasks[chunk_start:chunk_start + CHUNK]
             try:
