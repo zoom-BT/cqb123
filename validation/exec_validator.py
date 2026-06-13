@@ -103,11 +103,11 @@ def _run_b3d(script_path: str):
 
 # ── Point sampling (coarse, protected) ────────────────────────────────────────
 
-def _sample_occ(wrapped, n_points: int = 256, deflection: float = 1.0):
+def _sample_occ(wrapped, n_points: int = 128, deflection: float = 2.0):
     """
-    Sample surface points from an OCCT shape using a COARSE mesh.
-    deflection=1.0 keeps meshing fast even for complex parts.
-    Uses OCP (cadquery 2.7+ / build123d) with OCC.Core fallback.
+    Sample surface points from an OCCT shape using a VERY COARSE mesh.
+    deflection=2.0 and n_points=128 keep memory low for large batches.
+    Caps total collected points to avoid loading huge triangulations.
     """
     try:
         try:
@@ -117,6 +117,7 @@ def _sample_occ(wrapped, n_points: int = 256, deflection: float = 1.0):
             from OCP.BRep import BRep_Tool
             from OCP.TopLoc import TopLoc_Location
             from OCP.TopoDS import TopoDS
+            from OCP.BRepTools import BRepTools
         except ImportError:
             from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
             from OCC.Core.TopExp import TopExp_Explorer
@@ -124,29 +125,47 @@ def _sample_occ(wrapped, n_points: int = 256, deflection: float = 1.0):
             from OCC.Core.BRep import BRep_Tool
             from OCC.Core.TopLoc import TopLoc_Location
             from OCC.Core.TopoDS import TopoDS
+            from OCC.Core.BRepTools import BRepTools
 
-        BRepMesh_IncrementalMesh(wrapped, deflection).Perform()
+        mesh = BRepMesh_IncrementalMesh(wrapped, deflection)
+        mesh.Perform()
 
         pts = []
+        cap = n_points * 8   # hard cap on collected points
         exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-        while exp.More():
+        while exp.More() and len(pts) < cap:
             face = TopoDS.Face_s(exp.Current())
             loc = TopLoc_Location()
             tri = BRep_Tool.Triangulation_s(face, loc)
             if tri is not None:
                 trsf = loc.Transformation()
-                for i in range(1, tri.NbNodes() + 1):
+                nb = tri.NbNodes()
+                # Subsample within the face if it has many nodes
+                step = max(1, nb // 64)
+                for i in range(1, nb + 1, step):
                     node = tri.Node(i).Transformed(trsf)
-                    pts.append([node.X(), node.Y(), node.Z()])
+                    x, y, z = node.X(), node.Y(), node.Z()
+                    # Guard against overflow / degenerate coords
+                    if abs(x) < 1e7 and abs(y) < 1e7 and abs(z) < 1e7:
+                        pts.append([x, y, z])
+                    if len(pts) >= cap:
+                        break
             exp.Next()
+
+        # Release the mesh explicitly
+        try:
+            BRepTools.Clean_s(wrapped)
+        except Exception:
+            pass
+        del mesh
 
         if not pts:
             return None
-        arr = np.array(pts, dtype=np.float32)
+        arr = np.array(pts, dtype=np.float64)   # float64 avoids overflow
         if len(arr) > n_points:
             idx = np.random.choice(len(arr), n_points, replace=False)
             arr = arr[idx]
-        return arr
+        return arr.astype(np.float32)
     except Exception:
         return None
 
@@ -211,6 +230,7 @@ def validate_pair(
 # ── Worker with timeout ───────────────────────────────────────────────────────
 
 def _worker(args):
+    import gc
     cq_path, b3d_path, file_id, compute_chamfer, n_points, timeout = args
 
     # Install SIGALRM timeout (unix only)
@@ -223,6 +243,7 @@ def _worker(args):
                                compute_chamfer, n_points)
         if timeout > 0 and hasattr(signal, "SIGALRM"):
             signal.alarm(0)
+        gc.collect()
         return result
     except _Timeout:
         return ValidationResult(
@@ -324,14 +345,20 @@ def validate_batch(
 
     # Process in chunks so a crashed worker only loses its chunk,
     # not the whole batch. A fresh executor is created per chunk.
-    CHUNK = 500
+    CHUNK = 250
     done = 0
+
+    # max_tasks_per_child recycles workers to release OCCT memory (py3.11+)
+    import inspect
+    _ppe_kwargs = {"max_workers": workers}
+    if "max_tasks_per_child" in inspect.signature(ProcessPoolExecutor).parameters:
+        _ppe_kwargs["max_tasks_per_child"] = 50
 
     with open(output, file_mode, encoding="utf-8") as out_f:
         for chunk_start in range(0, n, CHUNK):
             chunk = tasks[chunk_start:chunk_start + CHUNK]
             try:
-                with ProcessPoolExecutor(max_workers=workers) as ex:
+                with ProcessPoolExecutor(**_ppe_kwargs) as ex:
                     futures = {ex.submit(_worker, t): t for t in chunk}
                     for fut in as_completed(futures):
                         try:
